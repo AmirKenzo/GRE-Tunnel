@@ -4,7 +4,7 @@
 
 set -e
 VERSION="3.1"
-BASE_URL="${GRE_INSTALL_URL:-https://ak6.ir/ak}"
+BASE_URL="${GRE_INSTALL_URL:-https://raw.githubusercontent.com/AmirKenzo/GRE-Tunnel/refs/heads/main}"
 INSTALLER_BIN="/usr/local/bin/install-gre-tunnels.sh"
 CONFIG_DIR="/etc/gre-tunnels"
 CONFIG="${CONFIG_DIR}/tunnels.conf"

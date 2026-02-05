@@ -86,7 +86,7 @@ cmd_update() {
   [ "$(id -u)" -eq 0 ] || { echo "Run as root for update."; return 1; }
   base_url="${1:-}"
   [ -z "$base_url" ] && [ -f "$BASE_URL_FILE" ] && base_url="$(cat "$BASE_URL_FILE")"
-  [ -z "$base_url" ] && base_url="https://ak6.ir/ak"
+  [ -z "$base_url" ] && base_url="https://raw.githubusercontent.com/AmirKenzo/GRE-Tunnel/refs/heads/main"
   echo "Updating from $base_url ..."
   work="/tmp/gre-tunnels-update"
   mkdir -p "$work"/etc/systemd/system "$work/usr-local-bin"
@@ -137,7 +137,7 @@ cmd_uninstall() {
 run_installer_menu() {
   local url
   [ -x "/usr/local/bin/install-gre-tunnels.sh" ] && exec sudo /usr/local/bin/install-gre-tunnels.sh --menu-only
-  url="https://ak6.ir/ak"
+  url="https://raw.githubusercontent.com/AmirKenzo/GRE-Tunnel/refs/heads/main"
   [ -f "$BASE_URL_FILE" ] && url="$(cat "$BASE_URL_FILE")"
   echo "Fetching installer..."
   curl -sSL -o /tmp/install-gre-tunnels.sh "$url/install-gre-tunnels.sh" || { echo "Fetch failed."; return 1; }

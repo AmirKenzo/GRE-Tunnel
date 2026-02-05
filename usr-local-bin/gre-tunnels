@@ -68,18 +68,21 @@ cmd_ips() {
 }
 
 cmd_load_config() {
-  [ -f "$NODE_FILE" ] || { echo "Set node first (menu option 2)."; return 1; }
-  echo "Path to config file (will replace $CONFIG and restart tunnels):"
+  echo "Path to config file (will replace $CONFIG):"
   read_input -p "> " path
   path="${path// /}"
   path="${path/#\~/$HOME}"
   [ -z "$path" ] && return
   [ -f "$path" ] || { echo "File not found: $path"; return 1; }
   cp "$path" "$CONFIG"
-  echo "Config loaded. Restarting tunnels..."
-  node="$(cat "$NODE_FILE")"
-  systemctl restart "${SVC}@${node}"
-  echo "Done. Tunnels are up with new config."
+  echo "Config loaded."
+  if [ -f "$NODE_FILE" ]; then
+    node="$(cat "$NODE_FILE")"
+    systemctl restart "${SVC}@${node}"
+    echo "Tunnels restarted with new config."
+  else
+    echo "Set this server's node (option 2) and start to apply tunnels."
+  fi
 }
 
 cmd_update() {

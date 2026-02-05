@@ -1,0 +1,210 @@
+#!/bin/bash
+# GRE Tunnels - management CLI and menu. Run: gre-tunnels [command]
+# VERSION=3.1
+
+VERSION="3.1"
+NODE_FILE="/etc/gre-tunnels/node"
+CONFIG="/etc/gre-tunnels/tunnels.conf"
+CONFIG_DIR="/etc/gre-tunnels"
+BASE_URL_FILE="/etc/gre-tunnels/base_url"
+SETUP_SCRIPT="/usr/local/bin/setup-gre.sh"
+SVC="gre-tunnels"
+
+read_input() { if [ -e /dev/tty ]; then read -r "$@" </dev/tty; else read -r "$@"; fi; }
+
+cmd_status() {
+  [ -f "$NODE_FILE" ] || { echo "No node set. Run installer or set node in menu."; return 1; }
+  node="$(cat "$NODE_FILE")"
+  systemctl status "${SVC}@${node}" --no-pager
+}
+
+cmd_restart() {
+  [ -f "$NODE_FILE" ] || { echo "No node set."; return 1; }
+  node="$(cat "$NODE_FILE")"
+  systemctl restart "${SVC}@${node}"
+  echo "Restarted ${SVC}@${node}"
+}
+
+cmd_logs() {
+  [ -f "$NODE_FILE" ] || { echo "No node set."; return 1; }
+  node="$(cat "$NODE_FILE")"
+  journalctl -u "${SVC}@${node}" -f --no-pager "${@:2}"
+}
+
+cmd_list() {
+  [ -f "$CONFIG" ] || { echo "No config at $CONFIG"; return 1; }
+  echo "Nodes in config:"
+  awk '/^\[irans\]/{s=1;next} /^\[externals\]/{s=2;next} /^\[/{s=0;next} s&&/=/{sub(/=.*/,"");if($0)print "  "$0}' "$CONFIG"
+}
+
+cmd_ips() {
+  [ -f "$NODE_FILE" ] || { echo "No node set."; return 1; }
+  [ -f "$CONFIG" ] || { echo "No config at $CONFIG"; return 1; }
+  node="$(cat "$NODE_FILE")"
+  echo "Running tunnels for node: $node (local = this server)"
+  echo "---------------------------------------------------"
+  tid=0
+  shown=0
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ "$line" != *","* ]] && continue
+    (( tid++ )) || true
+    ip link show "gre${tid}" &>/dev/null || continue
+    iran="${line%%,*}"; ext="${line#*,}"
+    iran="${iran%"${iran##*[![:space:]]}"}"
+    ext="${ext#"${ext%%[![:space:]]*}"}"
+    iran_ip=$(awk -v n="$iran" '/^\[irans\]/{s=1;next} /^\[/{s=0} s && index($0,n"=")==1{gsub(/^[^=]*=/,"");print;exit}' "$CONFIG")
+    ext_ip=$(awk -v n="$ext" '/^\[externals\]/{s=1;next} /^\[/{s=0} s && index($0,n"=")==1{gsub(/^[^=]*=/,"");print;exit}' "$CONFIG")
+    if [[ "$node" == "$iran" ]]; then
+      echo "  tunnel$tid: $iran -> $ext  |  local 10.10.$tid.1  |  remote 10.10.$tid.2 ($ext_ip)"
+    elif [[ "$node" == "$ext" ]]; then
+      echo "  tunnel$tid: $iran -> $ext  |  local 10.10.$tid.2  |  remote 10.10.$tid.1 ($iran_ip)"
+    fi
+    (( shown++ )) || true
+  done < <(awk '/^\[tunnels\]/{s=1;next} /^\[/{s=0} s' "$CONFIG")
+  [ "$shown" -eq 0 ] 2>/dev/null && echo "  (no tunnels running; start with option 2 or restart)"
+}
+
+cmd_load_config() {
+  [ -f "$NODE_FILE" ] || { echo "Set node first (menu option 2)."; return 1; }
+  echo "Path to config file (will replace $CONFIG and restart tunnels):"
+  read_input -p "> " path
+  path="${path// /}"
+  path="${path/#\~/$HOME}"
+  [ -z "$path" ] && return
+  [ -f "$path" ] || { echo "File not found: $path"; return 1; }
+  cp "$path" "$CONFIG"
+  echo "Config loaded. Restarting tunnels..."
+  node="$(cat "$NODE_FILE")"
+  systemctl restart "${SVC}@${node}"
+  echo "Done. Tunnels are up with new config."
+}
+
+cmd_update() {
+  [ "$(id -u)" -eq 0 ] || { echo "Run as root for update."; return 1; }
+  base_url="${1:-}"
+  [ -z "$base_url" ] && [ -f "$BASE_URL_FILE" ] && base_url="$(cat "$BASE_URL_FILE")"
+  [ -z "$base_url" ] && base_url="https://ak6.ir/ak"
+  echo "Updating from $base_url ..."
+  work="/tmp/gre-tunnels-update"
+  mkdir -p "$work"/etc/systemd/system "$work/usr-local-bin"
+  curl -sSL -o "$work/install-gre-tunnels.sh" "$base_url/install-gre-tunnels.sh" || true
+  curl -sSL -o "$work/usr-local-bin/setup-gre.sh" "$base_url/usr-local-bin/setup-gre.sh" || { echo "Fetch failed."; return 1; }
+  curl -sSL -o "$work/usr-local-bin/gre-tunnels" "$base_url/usr-local-bin/gre-tunnels" || { echo "Fetch failed."; return 1; }
+  curl -sSL -o "$work/etc/systemd/system/gre-tunnels@.service" "$base_url/etc/systemd/system/gre-tunnels%40.service" || true
+  for f in "$work/usr-local-bin/setup-gre.sh" "$work/usr-local-bin/gre-tunnels" "$work/install-gre-tunnels.sh"; do
+    [ -f "$f" ] && sed -i 's/\r$//' "$f" 2>/dev/null || true
+  done
+  cp "$work/usr-local-bin/setup-gre.sh" "$SETUP_SCRIPT"
+  chmod +x "$SETUP_SCRIPT"
+  cp "$work/usr-local-bin/gre-tunnels" "$0"
+  chmod +x "$0"
+  [ -f "$work/install-gre-tunnels.sh" ] && cp "$work/install-gre-tunnels.sh" "/usr/local/bin/install-gre-tunnels.sh" && chmod +x "/usr/local/bin/install-gre-tunnels.sh"
+  [ -f "$work/etc/systemd/system/gre-tunnels@.service" ] && cp "$work/etc/systemd/system/gre-tunnels@.service" "/etc/systemd/system/${SVC}@.service" && systemctl daemon-reload
+  rm -rf "$work"
+  new_ver=$(grep -m1 '^VERSION=' "$0" 2>/dev/null | cut -d'"' -f2)
+  echo "Update done. Version: ${new_ver:-?}"
+}
+
+cmd_stop() {
+  [ -f "$NODE_FILE" ] || { echo "No node set."; return 1; }
+  node="$(cat "$NODE_FILE")"
+  systemctl stop "${SVC}@${node}" 2>/dev/null || true
+  "$SETUP_SCRIPT" "$node" stop
+  echo "Tunnels stopped."
+}
+
+cmd_uninstall() {
+  [ "$(id -u)" -eq 0 ] || { echo "Run as root to uninstall."; return 1; }
+  node=""
+  [ -f "$NODE_FILE" ] && node="$(cat "$NODE_FILE")"
+  if [ -n "$node" ]; then
+    systemctl stop "${SVC}@${node}" 2>/dev/null || true
+    systemctl disable "${SVC}@${node}" 2>/dev/null || true
+    [ -x "$SETUP_SCRIPT" ] && "$SETUP_SCRIPT" "$node" stop 2>/dev/null || true
+  fi
+  rm -f "$SETUP_SCRIPT" "/usr/local/bin/install-gre-tunnels.sh"
+  rm -f "/etc/systemd/system/${SVC}@.service"
+  systemctl daemon-reload 2>/dev/null || true
+  echo "Uninstall: scripts and service removed. Tunnels are down."
+  echo "Config kept in $CONFIG_DIR (delete manually to remove all)."
+  rm -f "$0"
+  exit 0
+}
+
+run_installer_menu() {
+  local url
+  [ -x "/usr/local/bin/install-gre-tunnels.sh" ] && exec sudo /usr/local/bin/install-gre-tunnels.sh --menu-only
+  url="https://ak6.ir/ak"
+  [ -f "$BASE_URL_FILE" ] && url="$(cat "$BASE_URL_FILE")"
+  echo "Fetching installer..."
+  curl -sSL -o /tmp/install-gre-tunnels.sh "$url/install-gre-tunnels.sh" || { echo "Fetch failed."; return 1; }
+  sed -i 's/\r$//' /tmp/install-gre-tunnels.sh 2>/dev/null || true
+  exec sudo bash /tmp/install-gre-tunnels.sh --menu-only
+}
+
+main_menu() {
+  while true; do
+    echo ""
+    echo "=============================================="
+    echo "  GRE Tunnels  v${VERSION}"
+    echo "=============================================="
+    echo ""
+    echo "  1) Manage config (add/remove Iran, External, tunnels)"
+    echo "  2) Set this server's node and start tunnels"
+    echo "  3) Load config from file (replace current, apply)"
+    echo "  4) Update scripts from host"
+    echo "  5) Show my tunnels (with local IPs)"
+    echo "  6) Stop tunnels"
+    echo "  7) Uninstall (remove scripts and service)"
+    echo "  0) Exit"
+    echo ""
+    read_input -p "Choice: " c
+    case "${c}" in
+      0) exit 0 ;;
+      1) run_installer_menu ;;
+      2) run_installer_menu ;;
+      3) cmd_load_config ;;
+      4) cmd_update ;;
+      5) cmd_ips ;;
+      6) cmd_stop ;;
+      7)
+        read_input -p "Remove scripts and service? Config kept. [y/N]: " y
+        [[ "${y,,}" == "y" ]] && cmd_uninstall
+        ;;
+      *) echo "0-7";;
+    esac
+  done
+}
+
+case "${1:-}" in
+  status)   cmd_status ;;
+  restart)  cmd_restart ;;
+  logs)     cmd_logs ;;
+  list)     cmd_list ;;
+  ips)      cmd_ips ;;
+  load)     cmd_load_config ;;
+  update)   cmd_update "$2" ;;
+  stop)     cmd_stop ;;
+  uninstall) cmd_uninstall ;;
+  version)  echo "GRE Tunnels v${VERSION}" ;;
+  menu|"")  main_menu ;;
+  *)
+    echo "Usage: gre-tunnels [ command ]"
+    echo ""
+    echo "  (no args)   Main menu"
+    echo "  status     Service status"
+    echo "  restart    Restart tunnels"
+    echo "  logs       Follow logs"
+    echo "  list       List nodes in config"
+    echo "  ips        Show tunnels with local IPs"
+    echo "  load       Load config from file"
+    echo "  update     Update scripts from host"
+    echo "  stop       Stop tunnels"
+    echo "  uninstall  Remove scripts and service"
+    echo "  version    Show version"
+    exit 1
+    ;;
+esac

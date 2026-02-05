@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Shell scripts and systemd units must use LF (Linux servers)
+*.sh text eol=lf
+*.service text eol=lf
+etc/gre-tunnels/* text eol=lf

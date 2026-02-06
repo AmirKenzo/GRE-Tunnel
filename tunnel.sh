@@ -39,7 +39,7 @@ INSTALL_DIR="/usr/local/bin"
 INSTALL_CMD="gretunnel"
 CONFIG_DIR="/etc/gre-tunnels"
 # URL to fetch script when running via curl|bash (override with GRE_INSTALL_URL env)
-INSTALL_SCRIPT_URL="${GRE_INSTALL_URL:-https://raw.githubusercontent.com/AmirKenzo/GRE-Tunnel/refs/heads/main/tunnels.sh}"
+INSTALL_SCRIPT_URL="${GRE_INSTALL_URL:-https://raw.githubusercontent.com/AmirKenzo/GRE-Tunnel/refs/heads/main/tunnel.sh}"
 CONFIG_FILE="${CONFIG_DIR}/tunnels.conf"
 NODE_FILE="${CONFIG_DIR}/node"
 PORT_FORWARDS_FILE="${CONFIG_DIR}/port-forwards.conf"

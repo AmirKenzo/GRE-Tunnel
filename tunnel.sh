@@ -17,7 +17,7 @@ set -euo pipefail
 # GLOBAL VARIABLES
 #===============================================================================
 
-readonly VERSION="1.3"
+readonly VERSION="1.4"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # Resolve script path - handle piped execution (curl | bash) where $0 may be "bash"
@@ -1208,15 +1208,11 @@ enable_ip_forward() {
     fi
 }
 
-# Teardown all GRE interfaces
+# Teardown all GRE interfaces (any name, discovered via ip link)
 teardown_tunnels() {
-    local max_tunnels="${1:-64}"
     local i
-    
-    for (( i = 1; i <= max_tunnels; i++ )); do
-        if ip link show "gre${i}" &>/dev/null; then
-            ip tunnel del "gre${i}" 2>/dev/null || true
-        fi
+    for i in $(ip -o link show type gre 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
+        ip tunnel del "$i" 2>/dev/null || true
     done
 }
 

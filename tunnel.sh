@@ -17,7 +17,7 @@ set -euo pipefail
 # GLOBAL VARIABLES
 #===============================================================================
 
-readonly VERSION="1.4"
+readonly VERSION="1.5"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # Resolve script path - handle piped execution (curl | bash) where $0 may be "bash"
@@ -43,8 +43,9 @@ INSTALL_SCRIPT_URL="${GRE_INSTALL_URL:-https://raw.githubusercontent.com/AmirKen
 CONFIG_FILE="${CONFIG_DIR}/tunnels.conf"
 NODE_FILE="${CONFIG_DIR}/node"
 PORT_FORWARDS_FILE="${CONFIG_DIR}/port-forwards.conf"
-PORT_FORWARD_METHOD_FILE="${CONFIG_DIR}/port-forward-method"
 RINETD_CONF="/etc/rinetd.conf"
+GOST_VERSION="3.2.6"
+GOST_SERVICE_NAME="gre-tunnels-gost"
 LOG_FILE="/var/log/gre-tunnels.log"
 SERVICE_NAME="gre-tunnels"
 PORT_FORWARD_SERVICE_NAME="gre-tunnels-portfw"
@@ -870,22 +871,26 @@ remove_all_tunnels() {
 #===============================================================================
 # PORT FORWARDING
 #===============================================================================
-# Config: PORT_FORWARDS_FILE, one line per forward: listen_ip listen_port dest_ip dest_port
-# Method: iptables (nat DNAT) or rinetd (apt install rinetd)
+# Config: PORT_FORWARDS_FILE, one line per forward: method listen_ip listen_port dest_ip dest_port
+# method = gost or rinetd. Legacy 4-field lines (no method) are treated as gost.
 
-pf_get_method() {
-    if [[ -f "$PORT_FORWARD_METHOD_FILE" ]]; then
-        trim "$(cat "$PORT_FORWARD_METHOD_FILE" 2>/dev/null)"
-    else
-        echo ""
-    fi
+gost_installed() {
+    command -v gost &>/dev/null
 }
 
-pf_set_method() {
-    local m="$1"
-    [[ "$m" != "iptables" && "$m" != "rinetd" ]] && return 1
-    mkdir -p "$CONFIG_DIR"
-    echo "$m" > "$PORT_FORWARD_METHOD_FILE"
+gost_install() {
+    local tmpd url tarball
+    tmpd="$(mktemp -d)"
+    url="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+    tarball="${tmpd}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+    if ! wget -q -O "$tarball" "$url" 2>/dev/null; then
+        rm -rf "$tmpd"
+        return 1
+    fi
+    tar -xzf "$tarball" -C "$tmpd" 2>/dev/null || { rm -rf "$tmpd"; return 1; }
+    mv "${tmpd}/gost" /usr/local/bin/ 2>/dev/null || { rm -rf "$tmpd"; return 1; }
+    chmod +x /usr/local/bin/gost
+    rm -rf "$tmpd"
     return 0
 }
 
@@ -894,122 +899,141 @@ pf_list_entries() {
     grep -v '^[[:space:]]*#' "$PORT_FORWARDS_FILE" 2>/dev/null | grep -v '^[[:space:]]*$'
 }
 
-# Remove our iptables rules (when switching to rinetd or clearing)
-pf_teardown_iptables() {
-    local chain="GRE_FWD"
-    local fwd_chain="GRE_FWD_FWD"
-    local masq_chain="GRE_FWD_MASQ"
-    iptables -t nat -D PREROUTING -j "$chain" 2>/dev/null || true
-    iptables -t nat -D OUTPUT -j "$chain" 2>/dev/null || true
-    iptables -t nat -F "$chain" 2>/dev/null || true
-    iptables -t nat -X "$chain" 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -j "$masq_chain" 2>/dev/null || true
-    iptables -t nat -F "$masq_chain" 2>/dev/null || true
-    iptables -t nat -X "$masq_chain" 2>/dev/null || true
-    iptables -D FORWARD -j "$fwd_chain" 2>/dev/null || true
-    iptables -F "$fwd_chain" 2>/dev/null || true
-    iptables -X "$fwd_chain" 2>/dev/null || true
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save 2>/dev/null || true
-    fi
-}
-
-pf_apply_iptables() {
-    local chain="GRE_FWD"
-    local fwd_chain="GRE_FWD_FWD"
-    local masq_chain="GRE_FWD_MASQ"
-    enable_ip_forward
-    systemctl stop rinetd 2>/dev/null || true
-    # Create and flush our nat chain
-    iptables -t nat -N "$chain" 2>/dev/null || true
-    iptables -t nat -F "$chain" 2>/dev/null || true
-    iptables -t nat -N "$masq_chain" 2>/dev/null || true
-    iptables -t nat -F "$masq_chain" 2>/dev/null || true
-    # Create and flush our filter chain for FORWARD
-    iptables -N "$fwd_chain" 2>/dev/null || true
-    iptables -F "$fwd_chain" 2>/dev/null || true
+# Output lines for given method (gost or rinetd). Legacy 4-field lines = gost.
+pf_entries_for_method() {
+    local want="$1"
     while IFS= read -r line; do
         line="$(trim "$line")"
         [[ -z "$line" || "$line" == \#* ]] && continue
         set -- $line
-        [[ $# -lt 4 ]] && continue
-        local listen_ip="$1" listen_port="$2" dest_ip="$3" dest_port="$4"
-        iptables -t nat -A "$chain" -p tcp -d "$listen_ip" --dport "$listen_port" -j DNAT --to-destination "${dest_ip}:${dest_port}"
-        iptables -t nat -A "$masq_chain" -p tcp -d "$dest_ip" --dport "$dest_port" -j MASQUERADE
-        iptables -A "$fwd_chain" -p tcp -d "$dest_ip" --dport "$dest_port" -j ACCEPT
-        iptables -A "$fwd_chain" -p tcp -s "$dest_ip" -j ACCEPT
+        if [[ $# -eq 5 ]]; then
+            [[ "$1" == "$want" ]] && echo "$line"
+        else
+            [[ $# -ge 4 && "$want" == "gost" ]] && echo "$line"
+        fi
     done < <(pf_list_entries)
-    iptables -t nat -C PREROUTING -j "$chain" 2>/dev/null || iptables -t nat -A PREROUTING -j "$chain"
-    iptables -t nat -C OUTPUT -j "$chain" 2>/dev/null || iptables -t nat -A OUTPUT -j "$chain"
-    iptables -t nat -C POSTROUTING -j "$masq_chain" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$masq_chain"
-    iptables -C FORWARD -j "$fwd_chain" 2>/dev/null || iptables -A FORWARD -j "$fwd_chain"
-    if command -v iptables-save &>/dev/null && [[ -d /etc/iptables ]]; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+}
+
+# Parse one line to: method listen_ip listen_port dest_ip dest_port (vars prefixed with pf_parse_)
+pf_parse_line() {
+    local line="$1"
+    set -- $line
+    if [[ $# -eq 5 ]]; then
+        pf_parse_method="$1"
+        pf_parse_listen_ip="$2"
+        pf_parse_listen_port="$3"
+        pf_parse_dest_ip="$4"
+        pf_parse_dest_port="$5"
+    else
+        pf_parse_method="gost"
+        pf_parse_listen_ip="${1:-}"
+        pf_parse_listen_port="${2:-}"
+        pf_parse_dest_ip="${3:-}"
+        pf_parse_dest_port="${4:-}"
     fi
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save 2>/dev/null || true
+}
+
+pf_apply_gost() {
+    if ! gost_installed; then
+        warn "GOST not installed. Use menu option to install GOST."
+        return 0
     fi
+    local args=()
+    while IFS= read -r line; do
+        pf_parse_line "$line"
+        [[ -z "$pf_parse_listen_ip" ]] && continue
+        if [[ "$pf_parse_listen_ip" == "0.0.0.0" ]]; then
+            args+=( -L="tcp://:${pf_parse_listen_port}" )
+        else
+            args+=( -L="tcp://${pf_parse_listen_ip}:${pf_parse_listen_port}" )
+        fi
+        args+=( -F="tcp://${pf_parse_dest_ip}:${pf_parse_dest_port}" )
+    done < <(pf_entries_for_method "gost")
+    if [[ ${#args[@]} -eq 0 ]]; then
+        systemctl stop "${GOST_SERVICE_NAME}" 2>/dev/null || true
+        return 0
+    fi
+    local svc_path="/etc/systemd/system/${GOST_SERVICE_NAME}.service"
+    local exe
+    exe="$(command -v gost)"
+    {
+        echo "[Unit]"
+        echo "Description=GRE Tunnel Manager - GOST port forward"
+        echo "After=network-online.target network.target"
+        echo "Wants=network-online.target"
+        echo ""
+        echo "[Service]"
+        echo "Type=simple"
+        printf 'ExecStart=%s' "$exe"
+        printf ' %q' "${args[@]}"
+        echo ""
+        echo "Restart=always"
+        echo "RestartSec=3"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } > "$svc_path"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable "${GOST_SERVICE_NAME}" 2>/dev/null || true
+    systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
 }
 
 pf_apply_rinetd() {
     if ! command -v rinetd &>/dev/null; then
-        warn "rinetd not installed. Run: apt install rinetd -y"
-        return 1
+        warn "rinetd not installed. Use menu option to install rinetd."
+        return 0
     fi
-    pf_teardown_iptables
-    systemctl stop rinetd 2>/dev/null || service rinetd stop 2>/dev/null || true
     # rinetd format: bindaddress bindport connectaddress connectport
     : > "$RINETD_CONF"
     while IFS= read -r line; do
-        line="$(trim "$line")"
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        set -- $line
-        [[ $# -lt 4 ]] && continue
-        echo "$1 $2 $3 $4" >> "$RINETD_CONF"
-    done < <(pf_list_entries)
-    systemctl start rinetd 2>/dev/null || service rinetd start 2>/dev/null || true
+        pf_parse_line "$line"
+        [[ -z "$pf_parse_listen_ip" ]] && continue
+        echo "$pf_parse_listen_ip $pf_parse_listen_port $pf_parse_dest_ip $pf_parse_dest_port" >> "$RINETD_CONF"
+    done < <(pf_entries_for_method "rinetd")
+    systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
     systemctl enable rinetd 2>/dev/null || true
 }
 
 pf_apply() {
-    local method
-    method="$(pf_get_method)"
-    if [[ -z "$method" ]]; then
-        [[ -t 1 ]] && error "Port forward method not set. Choose iptables or rinetd in menu."
-        return 0
-    fi
-    if [[ "$method" == "iptables" ]]; then
-        pf_apply_iptables
-        [[ -t 1 ]] && success "Port forwards applied (iptables)."
-    else
-        pf_apply_rinetd
-        [[ -t 1 ]] && success "Port forwards applied (rinetd)."
-    fi
+    pf_apply_gost
+    pf_apply_rinetd
+    [[ -t 1 ]] && success "Port forwards applied (gost and rinetd)."
     return 0
 }
 
 pf_add() {
     echo
-    echo -ne "${CYAN}Listen IP (e.g. 0.0.0.0): ${NC}"
+    echo -e "  ${GREEN}1)${NC} GOST"
+    echo -e "  ${GREEN}2)${NC} rinetd"
+    echo -ne "${CYAN}Add forward with which? [1]: ${NC}"
+    read_input m
+    m="$(trim "$m")"
+    m="${m:-1}"
+    local method="gost"
+    [[ "$m" == "2" ]] && method="rinetd"
+    echo -ne "${CYAN}Listen IP [e.g.  0.0.0.0): ${NC}"
     read_input listen_ip
     listen_ip="$(trim "$listen_ip")"
-    echo -ne "${CYAN}Listen port: ${NC}"
+    listen_ip="${listen_ip:-0.0.0.0}"
+    echo -ne "${CYAN}Listen port [e.g. 700]: ${NC}"
     read_input listen_port
     listen_port="$(trim "$listen_port")"
-    echo -ne "${CYAN}Destination IP (e.g. 10.30.31.2): ${NC}"
+    listen_port="${listen_port:-700}"
+    echo -ne "${CYAN}Destination IP [e.g. 10.10.24.2]: ${NC}"
     read_input dest_ip
     dest_ip="$(trim "$dest_ip")"
-    echo -ne "${CYAN}Destination port: ${NC}"
+    dest_ip="${dest_ip:-10.10.24.2}"
+    echo -ne "${CYAN}Destination port(inbound) [e.g. 2073]: ${NC}"
     read_input dest_port
     dest_port="$(trim "$dest_port")"
-    [[ -z "$listen_ip" || -z "$listen_port" || -z "$dest_ip" || -z "$dest_port" ]] && { error "All fields required."; return; }
+    dest_port="${dest_port:-2073}"
     if ! [[ "$listen_port" =~ ^[0-9]+$ ]] || ! [[ "$dest_port" =~ ^[0-9]+$ ]]; then
         error "Ports must be numbers."
         return
     fi
     mkdir -p "$CONFIG_DIR"
-    echo "${listen_ip} ${listen_port} ${dest_ip} ${dest_port}" >> "$PORT_FORWARDS_FILE"
-    success "Added: ${listen_ip}:${listen_port} -> ${dest_ip}:${dest_port}"
+    echo "${method} ${listen_ip} ${listen_port} ${dest_ip} ${dest_port}" >> "$PORT_FORWARDS_FILE"
+    success "Added (${method}): ${listen_ip}:${listen_port} -> ${dest_ip}:${dest_port}"
     pf_apply
 }
 
@@ -1057,8 +1081,9 @@ pf_edit() {
     [[ -z "$line_no" ]] && { error "Entry not found."; return; }
     local line
     line="$(sed -n "${line_no}p" "$PORT_FORWARDS_FILE")"
-    set -- $line
-    local listen_ip="${1:-0.0.0.0}" listen_port="${2:-}" dest_ip="${3:-}" dest_port="${4:-}"
+    pf_parse_line "$line"
+    local method="$pf_parse_method" listen_ip="$pf_parse_listen_ip" listen_port="$pf_parse_listen_port" dest_ip="$pf_parse_dest_ip" dest_port="$pf_parse_dest_port"
+    echo -e "  ${CYAN}Method: ${method} (fixed)${NC}"
     echo -ne "${CYAN}Listen IP [${listen_ip}]: ${NC}"
     read_input in
     in="$(trim "$in")"
@@ -1075,23 +1100,23 @@ pf_edit() {
     read_input in
     in="$(trim "$in")"
     [[ -n "$in" ]] && dest_port="$in"
-    sed -i "${line_no}s/.*/${listen_ip} ${listen_port} ${dest_ip} ${dest_port}/" "$PORT_FORWARDS_FILE"
+    sed -i "${line_no}s/.*/${method} ${listen_ip} ${listen_port} ${dest_ip} ${dest_port}/" "$PORT_FORWARDS_FILE"
     success "Updated entry $num."
     pf_apply
 }
 
 pf_show_list() {
     echo -e "${YELLOW}${LINE_SEP}${NC}"
-    printf "  ${WHITE}%-4s %-16s %-8s %-16s %-8s${NC}\n" "#" "Listen IP" "Port" "Dest IP" "Port"
-    echo -e "  ${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${NC}"
+    printf "  ${WHITE}%-4s %-6s %-16s %-8s %-16s %-8s${NC}\n" "#" "Method" "Listen IP" "Port" "Dest IP" "Port"
+    echo -e "  ${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${LINE_H}${NC}"
     local n=0
     while IFS= read -r line; do
         line="$(trim "$line")"
         [[ -z "$line" || "$line" == \#* ]] && continue
         (( n++ )) || true
-        set -- $line
-        [[ $# -lt 4 ]] && continue
-        printf "  %-4s %-16s %-8s %-16s %-8s\n" "$n" "$1" "$2" "$3" "$4"
+        pf_parse_line "$line"
+        [[ -z "$pf_parse_listen_ip" ]] && continue
+        printf "  %-4s %-6s %-16s %-8s %-16s %-8s\n" "$n" "$pf_parse_method" "$pf_parse_listen_ip" "$pf_parse_listen_port" "$pf_parse_dest_ip" "$pf_parse_dest_port"
     done < <(pf_list_entries)
     echo -e "${YELLOW}${LINE_SEP}${NC}"
 }
@@ -1116,76 +1141,146 @@ EOF
     systemctl enable "${PORT_FORWARD_SERVICE_NAME}" 2>/dev/null || true
 }
 
+rinetd_installed() {
+    command -v rinetd &>/dev/null
+}
+
 port_forward_menu() {
     set +e
     while true; do
         clear_screen
-        local method
-        method="$(pf_get_method)"
-        [[ -z "$method" ]] && method="(not set)"
         echo
         colorize cyan "Port forwarding (survives reboot)" bold
-        echo -e "  Method: ${WHITE}${method}${NC}"
-        [[ "$method" == "rinetd" ]] && echo -e "  ${CYAN}rinetd config:${NC} ${WHITE}${RINETD_CONF}${NC}"
+        echo -e "  ${GREEN}Version: ${YELLOW}v${VERSION}${NC}"
+        if gost_installed; then
+            echo -e "  ${CYAN}GOST:${NC} ${GREEN}installed${NC}"
+        else
+            echo -e "  ${CYAN}GOST:${NC} ${RED}not installed${NC}"
+        fi
+        if rinetd_installed; then
+            echo -e "  ${CYAN}rinetd:${NC} ${GREEN}installed${NC}"
+        else
+            echo -e "  ${CYAN}rinetd:${NC} ${RED}not installed${NC}"
+        fi
         echo
         local opts=(
-            "${GREEN}1)${NC} Set method (iptables or rinetd)"
-            "${GREEN}2)${NC} Add forward (listen_ip port dest_ip dest_port)"
-            "${CYAN}3)${NC} List forwards"
-            "${YELLOW}4)${NC} Edit forward"
-            "${YELLOW}5)${NC} Delete forward"
-            "${YELLOW}6)${NC} Apply / Reload forwards now"
-            "${CYAN}7)${NC} Edit rinetd config with nano (${RINETD_CONF})"
+            "${GREEN}1)${NC} Add forward (choose GOST or rinetd)"
+            "${CYAN}2)${NC} List forwards"
+            "${YELLOW}3)${NC} Edit forward"
+            "${YELLOW}4)${NC} Delete forward"
+            "${YELLOW}5)${NC} Apply / Reload forwards now"
+            "${YELLOW}6)${NC} Restart both (GOST + rinetd)"
+            "${CYAN}7)${NC} Edit config (GOST service or rinetd)"
+            "${GREEN}8)${NC} Install GOST"
+            "${RED}9)${NC} Uninstall GOST"
+            "${GREEN}10)${NC} Install rinetd"
+            "${RED}11)${NC} Uninstall rinetd"
             "${WHITE}0)${NC} Back"
         )
         for o in "${opts[@]}"; do echo -e "  $o"; done
         echo
-        echo -ne "${CYAN}Choice [0-7]: ${NC}"
+        echo -ne "${CYAN}Choice [0-11]: ${NC}"
         read_input choice
         choice="$(trim "$choice")"
         case "$choice" in
-            1)
+            1) create_pf_systemd_service 2>/dev/null || true; pf_add; press_key ;;
+            2) echo; pf_show_list; press_key ;;
+            3) pf_edit; press_key ;;
+            4) pf_delete; press_key ;;
+            5) pf_apply; press_key ;;
+            6)
+                systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
+                systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
+                success "Both GOST and rinetd services restarted."
+                press_key
+                ;;
+            7)
                 echo
-                echo -e "  ${GREEN}1)${NC} iptables (nat table)"
-                echo -e "  ${GREEN}2)${NC} rinetd (apt install rinetd -y)"
-                echo -ne "${CYAN}Choose [1/2]: ${NC}"
-                read_input m
-                m="$(trim "$m")"
-                if [[ "$m" == "1" ]]; then
-                    pf_set_method "iptables"
-                    create_pf_systemd_service 2>/dev/null || true
-                    success "Method set to iptables."
-                    pf_apply
-                elif [[ "$m" == "2" ]]; then
-                    if ! command -v rinetd &>/dev/null; then
-                        info "Installing rinetd..."
-                        apt-get update -qq && apt-get install -y rinetd 2>/dev/null || { error "Install rinetd manually: apt install rinetd -y"; press_key; continue; }
+                echo -e "  ${GREEN}1)${NC} Edit GOST service config"
+                echo -e "  ${GREEN}2)${NC} Edit rinetd config (${RINETD_CONF})"
+                echo -ne "${CYAN}Which? [1/2]: ${NC}"
+                read_input ec
+                ec="$(trim "$ec")"
+                if [[ "$ec" == "1" ]]; then
+                    local gost_svc="/etc/systemd/system/${GOST_SERVICE_NAME}.service"
+                    if [[ ! -f "$gost_svc" ]]; then
+                        info "No gost service file yet. Add GOST forwards and Apply (option 5) first."
+                    elif [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
+                        nano "$gost_svc" </dev/tty >/dev/tty
+                        systemctl daemon-reload 2>/dev/null || true
+                        systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
+                        success "GOST service config saved and restarted."
+                    else
+                        info "Edit manually: $gost_svc"
                     fi
-                    pf_set_method "rinetd"
-                    create_pf_systemd_service 2>/dev/null || true
-                    success "Method set to rinetd."
-                    pf_apply
+                elif [[ "$ec" == "2" ]]; then
+                    if [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
+                        nano "$RINETD_CONF" </dev/tty >/dev/tty
+                        systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
+                        success "Rinetd config saved and restarted."
+                    else
+                        info "Config file: $RINETD_CONF"
+                    fi
                 else
                     error "Invalid choice."
                 fi
                 press_key
                 ;;
-            2) create_pf_systemd_service 2>/dev/null || true; pf_add; press_key ;;
-            3) echo; pf_show_list; press_key ;;
-            4) pf_edit; press_key ;;
-            5) pf_delete; press_key ;;
-            6) pf_apply; press_key ;;
-            7)
-                if [[ "$(pf_get_method)" == "rinetd" ]]; then
-                    if [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
-                        nano "$RINETD_CONF" </dev/tty >/dev/tty
-                        systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
-                        success "Rinetd config saved and service restarted."
-                    else
-                        info "Config file: $RINETD_CONF (edit manually, then restart rinetd)"
-                    fi
+            8)
+                if gost_installed; then
+                    info "GOST is already installed."
                 else
-                    info "Rinetd config path: $RINETD_CONF (set method to rinetd to edit from menu)"
+                    info "Installing GOST v${GOST_VERSION}..."
+                    if gost_install; then
+                        success "GOST installed to /usr/local/bin/gost"
+                        pf_apply
+                    else
+                        error "GOST install failed. Install manually:"
+                        echo "  wget https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+                        echo "  tar -xzvf gost_${GOST_VERSION}_linux_amd64.tar.gz"
+                        echo "  mv gost /usr/local/bin/"
+                        echo "  chmod +x /usr/local/bin/gost"
+                    fi
+                fi
+                press_key
+                ;;
+            9)
+                if ! gost_installed; then
+                    info "GOST is not installed."
+                else
+                    systemctl stop "${GOST_SERVICE_NAME}" 2>/dev/null || true
+                    systemctl disable "${GOST_SERVICE_NAME}" 2>/dev/null || true
+                    rm -f "/etc/systemd/system/${GOST_SERVICE_NAME}.service"
+                    systemctl daemon-reload 2>/dev/null || true
+                    rm -f /usr/local/bin/gost
+                    success "GOST uninstalled. Use option 8 to reinstall."
+                fi
+                press_key
+                ;;
+            10)
+                if rinetd_installed; then
+                    info "rinetd is already installed."
+                else
+                    info "Installing rinetd..."
+                    if apt-get update -qq && apt-get install -y rinetd 2>/dev/null; then
+                        success "rinetd installed."
+                        pf_apply
+                    else
+                        error "Install manually: apt install rinetd -y"
+                    fi
+                fi
+                press_key
+                ;;
+            11)
+                if ! rinetd_installed; then
+                    info "rinetd is not installed."
+                else
+                    if apt-get remove -y rinetd 2>/dev/null; then
+                        success "rinetd uninstalled."
+                        pf_apply
+                    else
+                        error "Uninstall manually: apt remove rinetd"
+                    fi
                 fi
                 press_key
                 ;;

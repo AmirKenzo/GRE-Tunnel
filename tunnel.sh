@@ -17,7 +17,7 @@ set -euo pipefail
 # GLOBAL VARIABLES
 #===============================================================================
 
-readonly VERSION="1.5"
+readonly VERSION="1.6"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # Resolve script path - handle piped execution (curl | bash) where $0 may be "bash"
@@ -933,49 +933,71 @@ pf_parse_line() {
     fi
 }
 
+# One systemd service per GOST forward to avoid multi -L/-F interference
 pf_apply_gost() {
     if ! gost_installed; then
         warn "GOST not installed. Use menu option to install GOST."
         return 0
     fi
-    local args=()
+    local exe
+    exe="$(command -v gost)"
+    local current_ports=()
+    # Stop and remove legacy single service if present
+    systemctl stop "${GOST_SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${GOST_SERVICE_NAME}" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${GOST_SERVICE_NAME}.service"
+    # Create one service per gost forward
     while IFS= read -r line; do
         pf_parse_line "$line"
         [[ -z "$pf_parse_listen_ip" ]] && continue
+        local listen_port="$pf_parse_listen_port"
+        local dest_ip="$pf_parse_dest_ip"
+        local dest_port="$pf_parse_dest_port"
+        current_ports+=( "$listen_port" )
+        local svc_name="${GOST_SERVICE_NAME}-${listen_port}"
+        local svc_path="/etc/systemd/system/${svc_name}.service"
+        local listen_arg
         if [[ "$pf_parse_listen_ip" == "0.0.0.0" ]]; then
-            args+=( -L="tcp://:${pf_parse_listen_port}" )
+            listen_arg="tcp://:${listen_port}"
         else
-            args+=( -L="tcp://${pf_parse_listen_ip}:${pf_parse_listen_port}" )
+            listen_arg="tcp://${pf_parse_listen_ip}:${listen_port}"
         fi
-        args+=( -F="tcp://${pf_parse_dest_ip}:${pf_parse_dest_port}" )
+        {
+            echo "[Unit]"
+            echo "Description=GRE Tunnel Manager - GOST forward port ${listen_port}"
+            echo "After=network-online.target network.target"
+            echo "Wants=network-online.target"
+            echo ""
+            echo "[Service]"
+            echo "Type=simple"
+            echo "ExecStart=$exe -L=${listen_arg} -F=tcp://${dest_ip}:${dest_port}"
+            echo "Restart=always"
+            echo "RestartSec=3"
+            echo ""
+            echo "[Install]"
+            echo "WantedBy=multi-user.target"
+        } > "$svc_path"
+        systemctl enable "${svc_name}" 2>/dev/null || true
+        systemctl start "${svc_name}" 2>/dev/null || true
     done < <(pf_entries_for_method "gost")
-    if [[ ${#args[@]} -eq 0 ]]; then
-        systemctl stop "${GOST_SERVICE_NAME}" 2>/dev/null || true
-        return 0
-    fi
-    local svc_path="/etc/systemd/system/${GOST_SERVICE_NAME}.service"
-    local exe
-    exe="$(command -v gost)"
-    {
-        echo "[Unit]"
-        echo "Description=GRE Tunnel Manager - GOST port forward"
-        echo "After=network-online.target network.target"
-        echo "Wants=network-online.target"
-        echo ""
-        echo "[Service]"
-        echo "Type=simple"
-        printf 'ExecStart=%s' "$exe"
-        printf ' %q' "${args[@]}"
-        echo ""
-        echo "Restart=always"
-        echo "RestartSec=3"
-        echo ""
-        echo "[Install]"
-        echo "WantedBy=multi-user.target"
-    } > "$svc_path"
+    # Stop and remove services for ports no longer in config
+    local f
+    for f in /etc/systemd/system/${GOST_SERVICE_NAME}-*.service; do
+        [[ -f "$f" ]] || continue
+        local base
+        base="$(basename "$f" .service)"
+        local port="${base#${GOST_SERVICE_NAME}-}"
+        local found=0
+        for p in "${current_ports[@]}"; do
+            [[ "$p" == "$port" ]] && { found=1; break; }
+        done
+        if [[ $found -eq 0 ]]; then
+            systemctl stop "$base" 2>/dev/null || true
+            systemctl disable "$base" 2>/dev/null || true
+            rm -f "$f"
+        fi
+    done
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable "${GOST_SERVICE_NAME}" 2>/dev/null || true
-    systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
 }
 
 pf_apply_rinetd() {
@@ -1175,11 +1197,12 @@ port_forward_menu() {
             "${RED}9)${NC} Uninstall GOST"
             "${GREEN}10)${NC} Install rinetd"
             "${RED}11)${NC} Uninstall rinetd"
+            "${RED}12)${NC} Clear all forwards & remove all GOST services"
             "${WHITE}0)${NC} Back"
         )
         for o in "${opts[@]}"; do echo -e "  $o"; done
         echo
-        echo -ne "${CYAN}Choice [0-11]: ${NC}"
+        echo -ne "${CYAN}Choice [0-12]: ${NC}"
         read_input choice
         choice="$(trim "$choice")"
         case "$choice" in
@@ -1189,29 +1212,61 @@ port_forward_menu() {
             4) pf_delete; press_key ;;
             5) pf_apply; press_key ;;
             6)
-                systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
+                local s
+                for s in /etc/systemd/system/${GOST_SERVICE_NAME}-*.service; do
+                    [[ -f "$s" ]] || continue
+                    systemctl restart "$(basename "$s" .service)" 2>/dev/null || true
+                done
                 systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
-                success "Both GOST and rinetd services restarted."
+                success "All GOST and rinetd services restarted."
                 press_key
                 ;;
             7)
                 echo
-                echo -e "  ${GREEN}1)${NC} Edit GOST service config"
+                echo -e "  ${GREEN}1)${NC} Edit GOST service config (choose port)"
                 echo -e "  ${GREEN}2)${NC} Edit rinetd config (${RINETD_CONF})"
                 echo -ne "${CYAN}Which? [1/2]: ${NC}"
                 read_input ec
                 ec="$(trim "$ec")"
                 if [[ "$ec" == "1" ]]; then
-                    local gost_svc="/etc/systemd/system/${GOST_SERVICE_NAME}.service"
-                    if [[ ! -f "$gost_svc" ]]; then
-                        info "No gost service file yet. Add GOST forwards and Apply (option 5) first."
-                    elif [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
-                        nano "$gost_svc" </dev/tty >/dev/tty
-                        systemctl daemon-reload 2>/dev/null || true
-                        systemctl restart "${GOST_SERVICE_NAME}" 2>/dev/null || true
-                        success "GOST service config saved and restarted."
+                    local gost_list=()
+                    local gost_ports=()
+                    while IFS= read -r line; do
+                        pf_parse_line "$line"
+                        [[ -z "$pf_parse_listen_ip" ]] && continue
+                        gost_list+=( "${pf_parse_listen_ip}:${pf_parse_listen_port} -> ${pf_parse_dest_ip}:${pf_parse_dest_port}" )
+                        gost_ports+=( "$pf_parse_listen_port" )
+                    done < <(pf_entries_for_method "gost")
+                    if [[ ${#gost_list[@]} -eq 0 ]]; then
+                        info "No GOST forwards defined. Add GOST forwards and Apply (option 5) first."
                     else
-                        info "Edit manually: $gost_svc"
+                        echo; echo "GOST forwards:"
+                        local i=0
+                        for entry in "${gost_list[@]}"; do
+                            (( i++ )) || true
+                            echo "  $i) $entry"
+                        done
+                        echo -ne "${CYAN}Entry number to edit config [1-${#gost_list[@]}]: ${NC}"
+                        read_input num
+                        num="$(trim "$num")"
+                        if [[ "$num" =~ ^[0-9]+$ && "$num" -ge 1 && "$num" -le ${#gost_list[@]} ]]; then
+                            local port="${gost_ports[$(( num - 1 ))]}"
+                            local gost_svc="/etc/systemd/system/${GOST_SERVICE_NAME}-${port}.service"
+                            if [[ -f "$gost_svc" ]]; then
+                                if [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
+                                    nano "$gost_svc" </dev/tty >/dev/tty
+                                    systemctl daemon-reload 2>/dev/null || true
+                                    systemctl restart "$(basename "$gost_svc" .service)" 2>/dev/null || true
+                                    success "GOST service config saved and restarted."
+                                else
+                                    info "Edit manually: $gost_svc"
+                                fi
+                            else
+                                info "Service file not found. Apply (option 5) first."
+                            fi
+                        else
+                            error "Invalid number."
+                        fi
                     fi
                 elif [[ "$ec" == "2" ]]; then
                     if [[ -e /dev/tty ]] && command -v nano &>/dev/null; then
@@ -1248,9 +1303,13 @@ port_forward_menu() {
                 if ! gost_installed; then
                     info "GOST is not installed."
                 else
-                    systemctl stop "${GOST_SERVICE_NAME}" 2>/dev/null || true
-                    systemctl disable "${GOST_SERVICE_NAME}" 2>/dev/null || true
-                    rm -f "/etc/systemd/system/${GOST_SERVICE_NAME}.service"
+                    local s
+                    for s in /etc/systemd/system/${GOST_SERVICE_NAME}-*.service; do
+                        [[ -f "$s" ]] || continue
+                        systemctl stop "$(basename "$s" .service)" 2>/dev/null || true
+                        systemctl disable "$(basename "$s" .service)" 2>/dev/null || true
+                    done
+                    rm -f "/etc/systemd/system/${GOST_SERVICE_NAME}.service" "/etc/systemd/system/${GOST_SERVICE_NAME}-"*.service
                     systemctl daemon-reload 2>/dev/null || true
                     rm -f /usr/local/bin/gost
                     success "GOST uninstalled. Use option 8 to reinstall."
@@ -1281,6 +1340,33 @@ port_forward_menu() {
                     else
                         error "Uninstall manually: apt remove rinetd"
                     fi
+                fi
+                press_key
+                ;;
+            12)
+                echo
+                warn "This will: (1) Clear ALL entries from port-forwards config. (2) Stop, disable and remove ALL GOST-related systemd services (current and any old names)."
+                echo -ne "${CYAN}Continue? [y/N]: ${NC}"
+                read_input confirm
+                confirm="$(trim "$confirm")"
+                if [[ "${confirm,,}" == "y" || "${confirm,,}" == "yes" ]]; then
+                    mkdir -p "$CONFIG_DIR"
+                    : > "$PORT_FORWARDS_FILE"
+                    local s
+                    for s in /etc/systemd/system/${GOST_SERVICE_NAME}.service /etc/systemd/system/${GOST_SERVICE_NAME}-*.service; do
+                        [[ -f "$s" ]] || continue
+                        local unit
+                        unit="$(basename "$s" .service)"
+                        systemctl stop "$unit" 2>/dev/null || true
+                        systemctl disable "$unit" 2>/dev/null || true
+                        rm -f "$s"
+                    done
+                    systemctl daemon-reload 2>/dev/null || true
+                    : > "$RINETD_CONF"
+                    systemctl restart rinetd 2>/dev/null || service rinetd restart 2>/dev/null || true
+                    success "All forwards cleared and all GOST services removed."
+                else
+                    info "Cancelled."
                 fi
                 press_key
                 ;;
